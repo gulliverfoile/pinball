@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Pinball Hexagonal - Funcional</title>
+  <title>Pinball Progresivo - Arquitectura Hexagonal</title>
   <style>
     body { margin:0; background:#111; overflow:hidden; display:flex; justify-content:center; align-items:center; height:100vh; }
     canvas { display:block; background:#1a1a2e; border:2px solid #4a4a6a; border-radius:8px; }
@@ -15,28 +15,23 @@
 <body>
   <canvas id="gameCanvas" width="800" height="900"></canvas>
   <div id="log"></div>
-  <div class="info">
-    <kbd>←</kbd> / <kbd>A</kbd> Flipper Izq · <kbd>→</kbd> / <kbd>D</kbd> Flipper Der · <kbd>Espacio</kbd> Lanzar
+  <div class="info" id="infoPanel">
+    <kbd>←</kbd> / <kbd>A</kbd> Flipper Izq · <kbd>→</kbd> / <kbd>D</kbd> Flipper Der · <kbd>Espacio</kbd> Lanzar<br>
+    <span style="font-size:12px;"><kbd>M</kbd> Menú · <kbd>1-3</kbd> Nivel</span>
   </div>
 
   <script type="importmap">
-    {
-      "imports": {
-        "matter-js": "https://cdn.jsdelivr.net/npm/matter-js@0.19.0/+esm"
-      }
-    }
+    { "imports": { "matter-js": "https://cdn.jsdelivr.net/npm/matter-js@0.19.0/+esm" } }
   </script>
 
   <script type="module">
     import * as Matter from 'matter-js';
 
-    // =============================================================================
-    // 0. UTILIDAD: Emisor de eventos simple para desacoplar
-    // =============================================================================
+    // ===========================================================================
+    // 0. UTILIDADES: EventBus (desacoplamiento total)
+    // ===========================================================================
     class EventBus {
-      constructor() {
-        this._listeners = {};
-      }
+      constructor() { this._listeners = {}; }
       on(event, callback) {
         if (!this._listeners[event]) this._listeners[event] = [];
         this._listeners[event].push(callback);
@@ -51,88 +46,60 @@
       }
     }
 
-    // =============================================================================
-    // 1. PUERTOS (interfaces abstractas)
-    // =============================================================================
+    // ===========================================================================
+    // 1. PUERTOS (Interfaces abstractas)
+    // ===========================================================================
     class IPhysics {
-      /** Inicializa el motor físico según el estado inicial del dominio */
       init(domainState, eventBus) { throw new Error('abstract'); }
-      /** Avanza la simulación un paso (delta en ms) */
       update(delta) { throw new Error('abstract'); }
-      /** Sincroniza las posiciones del motor hacia el estado del dominio (retorna estado) */
       sync(domainState) { throw new Error('abstract'); }
-      /** Activa un flipper (lado: 'left' | 'right') */
       activateFlipper(side) { throw new Error('abstract'); }
-      /** Desactiva un flipper */
       deactivateFlipper(side) { throw new Error('abstract'); }
-      /** Lanza la bola con una fuerza (0..1) */
       launchBall(force) { throw new Error('abstract'); }
-      /** Reinicia la bola en la posición de lanzamiento */
       resetBall() { throw new Error('abstract'); }
     }
 
     class IRenderer {
-      /** Dibuja el estado completo del juego */
-      draw(domainState, physicsState) { throw new Error('abstract'); }
+      draw(domainState, physicsState, screenState) { throw new Error('abstract'); }
     }
 
     class IInput {
-      /** Comienza a escuchar eventos de entrada; emite a través del bus */
       start(eventBus) { throw new Error('abstract'); }
-      /** Detiene la escucha */
       stop() { throw new Error('abstract'); }
     }
 
     class IConfig {
-      /** Carga la configuración de la mesa (promesa) */
       loadTable(source) { throw new Error('abstract'); }
     }
 
-    // =============================================================================
-    // 2. DOMINIO (estado y reglas puras, sin física)
-    // =============================================================================
-    /**
-     * Representa el estado mutable del juego (puntuación, vidas, luces...).
-     * NO contiene posiciones/velocidades de la bola, eso lo maneja el motor.
-     */
+    // ===========================================================================
+    // 2. DOMINIO: GameDomain (solo estado de una partida activa)
+    // ===========================================================================
     class GameDomain {
-      constructor(initialConfig) {
+      constructor(levelConfig) {
         this.score = 0;
-        this.lives = initialConfig.lives || 3;
+        this.lives = 3;
         this.ballActive = false;
-        this.mode = 'normal';
-        this.lights = {
-          bonus: false,
-          multiball: false
-        };
-        // Guardamos referencia a la configuración de elementos (bumpers, agujeros)
-        this.config = initialConfig;
-        // Contadores para modos especiales
+        this.mode = 'normal';        // 'normal', 'multiball', 'bonus'
+        this.lights = { bonus: false, multiball: false };
+        this.config = levelConfig;   // configuración de la mesa del nivel
         this.bumperHits = {};
-        initialConfig.bumpers.forEach(b => this.bumperHits[b.id] = 0);
+        levelConfig.bumpers.forEach(b => this.bumperHits[b.id] = 0);
+        this.levelObjectives = levelConfig.objectives || {}; // { targetScore: 500 }
+        this.objectivesMet = false;
       }
 
-      /** Procesa un evento del motor o de entrada */
+      /** Procesa eventos internos del juego (durante partida) */
       handleEvent(eventName, data) {
         switch (eventName) {
-          case 'bumper_hit':
-            this._onBumperHit(data.id);
-            break;
-          case 'drain':
-            this._onDrain();
-            break;
-          case 'ball_launched':
-            this.ballActive = true;
-            break;
-          case 'ball_lost':
-            this.ballActive = false;
-            break;
-          case 'game_over':
-            // nada extra
-            break;
-          default: break;
+          case 'bumper_hit': this._onBumperHit(data.id); break;
+          case 'drain': this._onDrain(); break;
+          case 'ball_launched': this.ballActive = true; break;
+          case 'ball_lost': this.ballActive = false; break;
         }
-        return this; // para encadenamiento
+        // Verificar objetivos tras cada evento
+        this._checkObjectives();
+        return this;
       }
 
       _onBumperHit(bumperId) {
@@ -140,41 +107,185 @@
         if (!bumper) return;
         this.score += bumper.points;
         this.bumperHits[bumperId] = (this.bumperHits[bumperId] || 0) + 1;
-        // Lógica de luces: si golpeamos el bumper central (b1) encendemos bonus
-        if (bumperId === 'b1') {
-          this.lights.bonus = true;
-        }
-        // Ejemplo: si todos los bumpers han sido golpeados, encendemos multiball
+        if (bumperId === 'b1') this.lights.bonus = true;
         const allHit = Object.values(this.bumperHits).every(hits => hits > 0);
-        if (allHit) {
-          this.lights.multiball = true;
-        }
+        if (allHit) this.lights.multiball = true;
       }
 
       _onDrain() {
         this.lives -= 1;
-        this.lights.bonus = false; // perder bola apaga bonus
-        if (this.lives <= 0) {
-          this.lives = 0;
-          // Emitir game over se hará desde el orquestador
-        }
+        this.lights.bonus = false;
       }
 
-      /** Reinicia el estado después de perder una vida (mantiene puntuación) */
+      _checkObjectives() {
+        if (this.objectivesMet) return;
+        const obj = this.levelObjectives;
+        if (obj.targetScore && this.score >= obj.targetScore) {
+          this.objectivesMet = true;
+        }
+        // Se podría añadir más condiciones (p.ej., golpear todos los bumpers)
+      }
+
       resetForNewBall() {
         this.ballActive = true;
         this.lights.bonus = false;
-        // Reiniciamos contadores de bumpers para la nueva bola
         this.config.bumpers.forEach(b => this.bumperHits[b.id] = 0);
         this.lights.multiball = false;
       }
     }
 
-    // =============================================================================
-    // 3. ADAPTADORES
-    // =============================================================================
+    // ===========================================================================
+    // 3. GESTORES DE PROGRESIÓN, PANTALLAS Y PERSISTENCIA
+    // ===========================================================================
 
-    // --- 3.1 ADAPTADOR DE FÍSICA (Matter.js) ---
+    /** Controla qué pantalla se muestra y la lógica de menú */
+    class ScreenManager {
+      constructor() {
+        this.current = 'menu'; // 'menu', 'game', 'scores', 'gameover'
+        this.selectedOption = 0;
+        this.menuOptions = ['Jugar', 'Puntuaciones', 'Créditos'];
+        this.scores = []; // se cargan del PersistenceManager
+        this.levelUnlocked = [true, false, false]; // máximo 3 niveles
+      }
+
+      goTo(screen) { this.current = screen; }
+
+      handleMenuInput(action) {
+        if (this.current !== 'menu') return false;
+        if (action === 'up') this.selectedOption = (this.selectedOption - 1 + this.menuOptions.length) % this.menuOptions.length;
+        if (action === 'down') this.selectedOption = (this.selectedOption + 1) % this.menuOptions.length;
+        if (action === 'select') {
+          const opt = this.menuOptions[this.selectedOption];
+          if (opt === 'Jugar') return 'start_game';
+          if (opt === 'Puntuaciones') { this.goTo('scores'); return null; }
+          if (opt === 'Créditos') { this.goTo('credits'); return null; }
+        }
+        return null;
+      }
+
+      handleScoresInput(action) {
+        if (this.current !== 'scores') return false;
+        if (action === 'select' || action === 'back') { this.goTo('menu'); return 'back_to_menu'; }
+        return null;
+      }
+
+      handleGameOverInput(action) {
+        if (this.current !== 'gameover') return false;
+        if (action === 'select' || action === 'back') { this.goTo('menu'); return 'back_to_menu'; }
+        return null;
+      }
+    }
+
+    /** Gestiona la progresión de niveles (desbloqueo) */
+    class LevelManager {
+      constructor() {
+        // 3 niveles predefinidos
+        this.levels = [
+          { id: 1, name: 'Nivel 1: Principiante', unlocked: true, configSource: 'level1' },
+          { id: 2, name: 'Nivel 2: Intermedio', unlocked: false, configSource: 'level2' },
+          { id: 3, name: 'Nivel 3: Experto', unlocked: false, configSource: 'level3' }
+        ];
+      }
+
+      unlockNext(currentLevelId) {
+        const next = this.levels.find(l => l.id === currentLevelId + 1);
+        if (next) next.unlocked = true;
+      }
+
+      isLevelUnlocked(levelId) {
+        const lvl = this.levels.find(l => l.id === levelId);
+        return lvl ? lvl.unlocked : false;
+      }
+
+      getLevelConfigSource(levelId) {
+        const lvl = this.levels.find(l => l.id === levelId);
+        return lvl ? lvl.configSource : 'level1';
+      }
+    }
+
+    /** Persistencia en localStorage */
+    class PersistenceManager {
+      saveHighScores(scores) {
+        localStorage.setItem('pinball_highscores', JSON.stringify(scores));
+      }
+      loadHighScores() {
+        const data = localStorage.getItem('pinball_highscores');
+        return data ? JSON.parse(data) : [];
+      }
+      saveUnlockedLevels(levels) {
+        const unlockedIds = levels.filter(l => l.unlocked).map(l => l.id);
+        localStorage.setItem('pinball_unlocked', JSON.stringify(unlockedIds));
+      }
+      loadUnlockedLevels() {
+        const data = localStorage.getItem('pinball_unlocked');
+        return data ? JSON.parse(data) : [1];
+      }
+      saveSettings(settings) {
+        localStorage.setItem('pinball_settings', JSON.stringify(settings));
+      }
+      loadSettings() {
+        const data = localStorage.getItem('pinball_settings');
+        return data ? JSON.parse(data) : { musicVolume: 80, sfxVolume: 100 };
+      }
+    }
+
+    // ===========================================================================
+    // 4. ADAPTADORES
+    // ===========================================================================
+
+    /** Configuración de mesas por nivel (en JSON) */
+    class JsonConfigAdapter extends IConfig {
+      async loadTable(source = 'level1') {
+        // Definimos 3 configuraciones de nivel distintas
+        const tables = {
+          level1: {
+            lives: 3,
+            bumpers: [
+              { id: 'b1', x: 400, y: 300, radius: 25, points: 100 },
+              { id: 'b2', x: 330, y: 240, radius: 25, points: 150 },
+              { id: 'b3', x: 470, y: 240, radius: 25, points: 150 }
+            ],
+            drains: [
+              { id: 'drain_left', x: 200, y: 830, radius: 22 },
+              { id: 'drain_right', x: 600, y: 830, radius: 22 }
+            ],
+            objectives: { targetScore: 500 }
+          },
+          level2: {
+            lives: 2,
+            bumpers: [
+              { id: 'b1', x: 400, y: 280, radius: 22, points: 150 },
+              { id: 'b2', x: 300, y: 220, radius: 22, points: 200 },
+              { id: 'b3', x: 500, y: 220, radius: 22, points: 200 },
+              { id: 'b4', x: 400, y: 180, radius: 20, points: 250 }
+            ],
+            drains: [
+              { id: 'drain_center', x: 400, y: 830, radius: 22 }
+            ],
+            objectives: { targetScore: 800 }
+          },
+          level3: {
+            lives: 1,
+            bumpers: [
+              { id: 'b1', x: 350, y: 300, radius: 20, points: 200 },
+              { id: 'b2', x: 450, y: 300, radius: 20, points: 200 },
+              { id: 'b3', x: 250, y: 220, radius: 18, points: 300 },
+              { id: 'b4', x: 550, y: 220, radius: 18, points: 300 },
+              { id: 'b5', x: 400, y: 150, radius: 18, points: 400 }
+            ],
+            drains: [
+              { id: 'drain_left', x: 150, y: 830, radius: 25 },
+              { id: 'drain_right', x: 650, y: 830, radius: 25 },
+              { id: 'drain_center', x: 400, y: 840, radius: 25 }
+            ],
+            objectives: { targetScore: 1200 }
+          }
+        };
+        return tables[source] || tables.level1;
+      }
+    }
+
+    /** Adaptador de física con Matter.js (igual que antes, solo usa la config del nivel) */
     class MatterPhysicsAdapter extends IPhysics {
       constructor(canvasWidth, canvasHeight) {
         super();
@@ -188,51 +299,33 @@
         this.bumperBodies = [];
         this.drainSensors = [];
         this.eventBus = null;
-        // Parámetros de flippers
         this.flipperLength = 70;
         this.flipperWidth = 14;
-        this.flipperAngleRest = 0.1;  // ligeramente hacia arriba en reposo
-        this.flipperAngleActive = -0.5; // hacia arriba al activar
-        this.flipperForce = 0.15;       // torque
-        this.flipperDamping = 0.9;
-        // Plunger
-        this.plungerReady = false;
-        this.launchForceBase = -0.05; // impulso vertical (negativo = arriba)
+        this.flipperForce = 0.15;
+        this._flipperActiveState = { left: false, right: false };
+        this.launchForceBase = -0.05;
       }
 
       init(domainState, eventBus) {
         this.eventBus = eventBus;
-        // Crear motor con gravedad
-        this.engine = Matter.Engine.create({
-          gravity: { x: 0, y: 0.8, scale: 0.001 } // gravedad suave pero presente
-        });
-
-        // Construir paredes (estáticas)
+        // Limpiar mundo anterior si existe
+        if (this.engine) {
+          Matter.World.clear(this.engine.world);
+          Matter.Engine.clear(this.engine);
+        }
+        this.engine = Matter.Engine.create({ gravity: { x: 0, y: 0.8, scale: 0.001 } });
         this._createWalls();
-
-        // Crear bumpers (estáticos, alta restitución)
         this._createBumpers(domainState.config.bumpers);
-
-        // Crear sensores de drenaje (agujeros)
         this._createDrainSensors(domainState.config.drains);
-
-        // Crear flippers (cuerpos dinámicos con restricción de ángulo)
         this._createFlippers();
-
-        // Crear bola en posición de lanzamiento
         this._createBall();
-
-        // Escuchar colisiones
         Matter.Events.on(this.engine, 'collisionStart', (event) => {
           event.pairs.forEach(pair => {
             const { bodyA, bodyB } = pair;
-            // Determinar si colisiona con bumper
             const bumper = this.bumperBodies.find(b => b === bodyA || b === bodyB);
             if (bumper && (bodyA === this.ballBody || bodyB === this.ballBody)) {
-              // Emitir evento de bumper hit con el id
               this.eventBus.emit('bumper_hit', { id: bumper.label });
             }
-            // Determinar si colisiona con sensor de drenaje
             const drain = this.drainSensors.find(d => d === bodyA || d === bodyB);
             if (drain && (bodyA === this.ballBody || bodyB === this.ballBody)) {
               this.eventBus.emit('drain', {});
@@ -242,33 +335,24 @@
       }
 
       _createWalls() {
-        const w = this.width;
-        const h = this.height;
-        const wallOptions = { isStatic: true, friction: 0.2, restitution: 0.3, label: 'wall' };
+        const w = this.width, h = this.height, opts = { isStatic: true, friction: 0.2, restitution: 0.3, label: 'wall' };
         const walls = [
-          // pared izquierda
-          Matter.Bodies.rectangle(20, h/2, 20, h, wallOptions),
-          // pared derecha
-          Matter.Bodies.rectangle(w - 20, h/2, 20, h, wallOptions),
-          // pared superior
-          Matter.Bodies.rectangle(w/2, 20, w, 20, wallOptions),
-          // pared inferior (excepto hueco central y laterales para drenaje)
-          // Dividimos en segmentos
-          Matter.Bodies.rectangle(w/2, h - 20, 200, 20, { ...wallOptions, label: 'bottom_center' }),
-          Matter.Bodies.rectangle(50, h - 20, 80, 20, { ...wallOptions, label: 'bottom_left' }),
-          Matter.Bodies.rectangle(w - 50, h - 20, 80, 20, { ...wallOptions, label: 'bottom_right' })
+          Matter.Bodies.rectangle(20, h/2, 20, h, opts),
+          Matter.Bodies.rectangle(w-20, h/2, 20, h, opts),
+          Matter.Bodies.rectangle(w/2, 20, w, 20, opts),
+          Matter.Bodies.rectangle(w/2, h-20, 200, 20, { ...opts, label: 'bottom_center' }),
+          Matter.Bodies.rectangle(50, h-20, 80, 20, { ...opts, label: 'bottom_left' }),
+          Matter.Bodies.rectangle(w-50, h-20, 80, 20, { ...opts, label: 'bottom_right' })
         ];
         walls.forEach(wall => Matter.Composite.add(this.engine.world, wall));
         this.wallBodies = walls;
       }
 
       _createBumpers(bumpersConfig) {
+        this.bumperBodies = [];
         bumpersConfig.forEach(cfg => {
           const body = Matter.Bodies.circle(cfg.x, cfg.y, cfg.radius, {
-            isStatic: true,
-            restitution: 1.2,
-            friction: 0.1,
-            label: cfg.id
+            isStatic: true, restitution: 1.2, friction: 0.1, label: cfg.id
           });
           Matter.Composite.add(this.engine.world, body);
           this.bumperBodies.push(body);
@@ -276,11 +360,10 @@
       }
 
       _createDrainSensors(drainsConfig) {
+        this.drainSensors = [];
         drainsConfig.forEach(cfg => {
           const sensor = Matter.Bodies.circle(cfg.x, cfg.y, cfg.radius, {
-            isStatic: true,
-            isSensor: true,
-            label: cfg.id
+            isStatic: true, isSensor: true, label: cfg.id
           });
           Matter.Composite.add(this.engine.world, sensor);
           this.drainSensors.push(sensor);
@@ -288,44 +371,20 @@
       }
 
       _createFlippers() {
-        // Posiciones de pivote
-        const pivotLeft = { x: 180, y: 800 };
-        const pivotRight = { x: 620, y: 800 };
-        const width = this.flipperWidth;
-        const length = this.flipperLength;
-
-        // Flipper izquierdo: rectángulo inclinado, pivote en extremo derecho
+        const pivotLeft = { x: 180, y: 800 }, pivotRight = { x: 620, y: 800 };
+        const length = this.flipperLength, width = this.flipperWidth;
         const flipperLeft = Matter.Bodies.rectangle(pivotLeft.x + length/2, pivotLeft.y, length, width, {
-          density: 0.02,
-          friction: 0.4,
-          restitution: 0.1,
-          label: 'flipper_left',
-          collisionFilter: { group: -1 } // colisiona con todo excepto otros flippers
+          density: 0.02, friction: 0.4, restitution: 0.1, label: 'flipper_left', collisionFilter: { group: -1 }
         });
-        // Restricción de pivote (revolute libre)
         const constraintLeft = Matter.Constraint.create({
-          pointA: pivotLeft,
-          bodyB: flipperLeft,
-          pointB: { x: -length/2, y: 0 },
-          stiffness: 1,
-          length: 0
+          pointA: pivotLeft, bodyB: flipperLeft, pointB: { x: -length/2, y: 0 }, stiffness: 1, length: 0
         });
-        // Flipper derecho (simétrico)
         const flipperRight = Matter.Bodies.rectangle(pivotRight.x - length/2, pivotRight.y, length, width, {
-          density: 0.02,
-          friction: 0.4,
-          restitution: 0.1,
-          label: 'flipper_right',
-          collisionFilter: { group: -1 }
+          density: 0.02, friction: 0.4, restitution: 0.1, label: 'flipper_right', collisionFilter: { group: -1 }
         });
         const constraintRight = Matter.Constraint.create({
-          pointA: pivotRight,
-          bodyB: flipperRight,
-          pointB: { x: length/2, y: 0 },
-          stiffness: 1,
-          length: 0
+          pointA: pivotRight, bodyB: flipperRight, pointB: { x: length/2, y: 0 }, stiffness: 1, length: 0
         });
-
         Matter.Composite.add(this.engine.world, [flipperLeft, flipperRight, constraintLeft, constraintRight]);
         this.flipperBodies.left = flipperLeft;
         this.flipperBodies.right = flipperRight;
@@ -334,108 +393,53 @@
       }
 
       _createBall() {
-        // Posición de lanzamiento (encima del plunger)
-        const ballX = this.width / 2;
-        const ballY = this.height - 120;
-        this.ballBody = Matter.Bodies.circle(ballX, ballY, 12, {
-          restitution: 0.5,
-          friction: 0.02,
-          density: 0.015,
-          label: 'ball'
-        });
+        const ballX = this.width/2, ballY = this.height - 120;
+        this.ballBody = Matter.Bodies.circle(ballX, ballY, 12, { restitution: 0.5, friction: 0.02, density: 0.015, label: 'ball' });
         Matter.Composite.add(this.engine.world, this.ballBody);
       }
 
-      update(delta) {
-        Matter.Engine.update(this.engine, delta);
-        // Limitar el ángulo de los flippers manualmente
-        this._constrainFlipperAngle('left');
-        this._constrainFlipperAngle('right');
-      }
-
-      _constrainFlipperAngle(side) {
-        const body = this.flipperBodies[side];
-        if (!body) return;
-        const pivot = this.flipperPivots[side];
-        const sign = side === 'left' ? 1 : -1;
-        // Calcular ángulo actual respecto al pivote
-        const dx = body.position.x - pivot.x;
-        const dy = body.position.y - pivot.y;
-        let angle = Math.atan2(dy, dx);
-        // Ángulo deseado en reposo: horizontal con ligera inclinación (0.1 rad hacia arriba)
-        const restAngle = side === 'left' ? 0.2 : Math.PI - 0.2;
-        // Aplicar torque para volver a reposo si no está activado
-        if (!this._flipperActiveState[side]) {
-          const diff = restAngle - angle;
-          Matter.Body.setAngularVelocity(body, diff * 0.1);
-        }
-        // Limitar ángulo máximo activo
-        const maxAngle = side === 'left' ? -0.6 : Math.PI + 0.6;
-        const minAngle = restAngle;
-        if (side === 'left') {
-          if (angle < maxAngle) Matter.Body.setAngle(body, maxAngle);
-          if (angle > minAngle) Matter.Body.setAngle(body, minAngle);
-        } else {
-          if (angle > maxAngle) Matter.Body.setAngle(body, maxAngle);
-          if (angle < minAngle) Matter.Body.setAngle(body, minAngle);
-        }
-      }
-
-      // Estado de activación de flippers (booleano)
-      _flipperActiveState = { left: false, right: false };
+      update(delta) { Matter.Engine.update(this.engine, delta); }
 
       activateFlipper(side) {
         this._flipperActiveState[side] = true;
         const body = this.flipperBodies[side];
         if (!body) return;
-        // Aplicar torque fuerte para moverlo
         const torque = side === 'left' ? -this.flipperForce : this.flipperForce;
         Matter.Body.setAngularVelocity(body, torque);
       }
 
-      deactivateFlipper(side) {
-        this._flipperActiveState[side] = false;
-        // La restricción de ángulo en update lo devolverá a reposo
-      }
+      deactivateFlipper(side) { this._flipperActiveState[side] = false; }
 
       launchBall(force) {
         if (!this.ballBody) return;
-        // Aplicar impulso vertical hacia arriba
-        const impulse = force * this.launchForceBase * 1000; // escalado
-        Matter.Body.applyForce(this.ballBody, this.ballBody.position, { x: 0, y: impulse });
+        Matter.Body.applyForce(this.ballBody, this.ballBody.position, { x: 0, y: force * this.launchForceBase * 1000 });
         this.eventBus.emit('ball_launched', {});
       }
 
       resetBall() {
-        if (this.ballBody) {
-          Matter.Composite.remove(this.engine.world, this.ballBody);
-        }
+        if (this.ballBody) Matter.Composite.remove(this.engine.world, this.ballBody);
         this._createBall();
         this.eventBus.emit('ball_reset', {});
       }
 
-      /**
-       * Sincroniza el estado del dominio con las posiciones reales de la bola
-       * Retorna un objeto con la información necesaria para el render
-       */
       sync(domainState) {
-        if (!this.ballBody) return { ball: null };
-        const ball = {
-          x: this.ballBody.position.x,
-          y: this.ballBody.position.y,
-          angle: this.ballBody.angle,
-          active: domainState.ballActive
+        if (!this.ballBody) return { ball: null, flipperAngles: { left: 0, right: 0 } };
+        return {
+          ball: {
+            x: this.ballBody.position.x,
+            y: this.ballBody.position.y,
+            angle: this.ballBody.angle,
+            active: domainState.ballActive
+          },
+          flipperAngles: {
+            left: this.flipperBodies.left ? this.flipperBodies.left.angle : 0,
+            right: this.flipperBodies.right ? this.flipperBodies.right.angle : 0
+          }
         };
-        // También retornamos los ángulos de los flippers para dibujarlos
-        const flipperAngles = {
-          left: this.flipperBodies.left ? this.flipperBodies.left.angle : 0,
-          right: this.flipperBodies.right ? this.flipperBodies.right.angle : 0
-        };
-        return { ball, flipperAngles };
       }
     }
 
-    // --- 3.2 ADAPTADOR DE RENDERIZADO (Canvas 2D) ---
+    /** Renderizado Canvas: ahora incluye dibujo de menús y pantallas */
     class CanvasRendererAdapter extends IRenderer {
       constructor(canvas) {
         super();
@@ -443,287 +447,314 @@
         this.ctx = canvas.getContext('2d');
       }
 
-      draw(domainState, physicsState) {
+      draw(domainState, physicsState, screenState) {
         const ctx = this.ctx;
-        const w = this.canvas.width;
-        const h = this.canvas.height;
+        const w = this.canvas.width, h = this.canvas.height;
+        ctx.clearRect(0, 0, w, h);
+        if (screenState.current === 'game' || screenState.current === 'gameover') {
+          this._drawGame(domainState, physicsState);
+          if (screenState.current === 'gameover') this._drawGameOverOverlay();
+        } else if (screenState.current === 'menu') {
+          this._drawMenu(screenState);
+        } else if (screenState.current === 'scores') {
+          this._drawScores(screenState);
+        } else if (screenState.current === 'credits') {
+          this._drawCredits();
+        }
+      }
 
-        // Fondo
-        ctx.fillStyle = '#1a1a2e';
-        ctx.fillRect(0, 0, w, h);
-
-        // Borde decorativo
-        ctx.strokeStyle = '#4a4a6a';
-        ctx.lineWidth = 4;
-        ctx.strokeRect(20, 20, w - 40, h - 40);
-
-        // Dibujar bumpers
+      _drawGame(domainState, physicsState) {
+        const ctx = this.ctx, w = this.canvas.width, h = this.canvas.height;
+        ctx.fillStyle = '#1a1a2e'; ctx.fillRect(0, 0, w, h);
+        ctx.strokeStyle = '#4a4a6a'; ctx.lineWidth = 4; ctx.strokeRect(20, 20, w-40, h-40);
         domainState.config.bumpers.forEach(b => {
-          ctx.beginPath();
-          ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
-          ctx.fillStyle = domainState.lights.bonus && b.id === 'b1' ? '#ff6b6b' : '#ffd93d';
-          ctx.fill();
-          ctx.strokeStyle = '#fff';
-          ctx.lineWidth = 2;
-          ctx.stroke();
+          ctx.beginPath(); ctx.arc(b.x, b.y, b.radius, 0, Math.PI*2);
+          ctx.fillStyle = (domainState.lights.bonus && b.id === 'b1') ? '#ff6b6b' : '#ffd93d';
+          ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
         });
-
-        // Dibujar drenajes (agujeros)
         domainState.config.drains.forEach(d => {
-          ctx.beginPath();
-          ctx.arc(d.x, d.y, d.radius, 0, Math.PI * 2);
-          ctx.fillStyle = '#111';
-          ctx.fill();
-          ctx.strokeStyle = '#555';
-          ctx.lineWidth = 2;
-          ctx.stroke();
+          ctx.beginPath(); ctx.arc(d.x, d.y, d.radius, 0, Math.PI*2);
+          ctx.fillStyle = '#111'; ctx.fill(); ctx.strokeStyle = '#555'; ctx.lineWidth = 2; ctx.stroke();
         });
-
-        // Dibujar flippers (usando ángulos reales del motor)
         const drawFlipper = (side) => {
           const angle = physicsState.flipperAngles[side];
-          const pivot = side === 'left' ? { x: 180, y: 800 } : { x: 620, y: 800 };
-          const length = 70;
-          const width = 14;
-          ctx.save();
-          ctx.translate(pivot.x, pivot.y);
-          ctx.rotate(angle);
-          ctx.fillStyle = '#4ecdc4';
-          ctx.shadowColor = '#4ecdc4';
-          ctx.shadowBlur = 10;
-          // Rectángulo centrado en el pivote? Ajustar según creación de cuerpos
-          if (side === 'left') {
-            ctx.fillRect(0, -width/2, length, width);
-          } else {
-            ctx.fillRect(-length, -width/2, length, width);
-          }
+          const pivot = side === 'left' ? { x:180, y:800 } : { x:620, y:800 };
+          ctx.save(); ctx.translate(pivot.x, pivot.y); ctx.rotate(angle);
+          ctx.fillStyle = '#4ecdc4'; ctx.shadowColor = '#4ecdc4'; ctx.shadowBlur = 10;
+          if (side === 'left') ctx.fillRect(0, -7, 70, 14);
+          else ctx.fillRect(-70, -7, 70, 14);
           ctx.restore();
         };
-        drawFlipper('left');
-        drawFlipper('right');
-
-        // Luces indicadoras
-        const luzPositions = { bonus: { x: 720, y: 80 }, multiball: { x: 720, y: 120 } };
+        drawFlipper('left'); drawFlipper('right');
+        const luzPos = { bonus: {x:720, y:80}, multiball: {x:720, y:120} };
         Object.entries(domainState.lights).forEach(([name, active]) => {
-          const pos = luzPositions[name];
-          if (!pos) return;
-          ctx.beginPath();
-          ctx.arc(pos.x, pos.y, 12, 0, Math.PI * 2);
-          ctx.fillStyle = active ? '#00ff88' : '#333';
-          ctx.fill();
-          ctx.strokeStyle = active ? '#00ff88' : '#555';
-          ctx.lineWidth = 2;
-          ctx.stroke();
-          ctx.fillStyle = '#fff';
-          ctx.font = '10px sans-serif';
-          ctx.textAlign = 'center';
-          ctx.fillText(name.toUpperCase(), pos.x, pos.y + 30);
+          const pos = luzPos[name]; if (!pos) return;
+          ctx.beginPath(); ctx.arc(pos.x, pos.y, 12, 0, Math.PI*2);
+          ctx.fillStyle = active ? '#00ff88' : '#333'; ctx.fill();
+          ctx.strokeStyle = active ? '#00ff88' : '#555'; ctx.lineWidth = 2; ctx.stroke();
+          ctx.fillStyle = '#fff'; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+          ctx.fillText(name.toUpperCase(), pos.x, pos.y+30);
         });
-
-        // Bola
         if (physicsState.ball && domainState.ballActive) {
-          ctx.beginPath();
-          ctx.arc(physicsState.ball.x, physicsState.ball.y, 12, 0, Math.PI * 2);
-          ctx.fillStyle = '#f8f9fa';
-          ctx.shadowColor = '#fff';
-          ctx.shadowBlur = 15;
-          ctx.fill();
-          ctx.shadowBlur = 0;
+          ctx.beginPath(); ctx.arc(physicsState.ball.x, physicsState.ball.y, 12, 0, Math.PI*2);
+          ctx.fillStyle = '#f8f9fa'; ctx.shadowColor = '#fff'; ctx.shadowBlur = 15; ctx.fill(); ctx.shadowBlur = 0;
         }
-
-        // Texto informativo
-        ctx.fillStyle = '#fff';
-        ctx.font = '20px monospace';
+        ctx.fillStyle = '#fff'; ctx.font = '20px monospace';
         ctx.fillText(`Puntos: ${domainState.score}`, 60, 80);
         ctx.fillText(`Vidas: ${domainState.lives}`, 60, 120);
-        ctx.fillStyle = '#ffd93d';
-        ctx.font = '16px monospace';
-        ctx.fillText(`Modo: ${domainState.mode}`, 60, 160);
+        ctx.fillStyle = '#ffd93d'; ctx.font = '16px monospace';
+        ctx.fillText(`Nivel: ${domainState.config.levelName || '?'}`, 60, 160);
+        if (domainState.objectivesMet) {
+          ctx.fillStyle = '#00ff88'; ctx.font = '18px monospace';
+          ctx.fillText('¡Objetivo completado!', 400, 200);
+        }
+      }
+
+      _drawGameOverOverlay() {
+        const ctx = this.ctx, w = this.canvas.width, h = this.canvas.height;
+        ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = '#ff4444'; ctx.font = '48px monospace'; ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', w/2, h/2 - 40);
+        ctx.fillStyle = '#fff'; ctx.font = '24px monospace';
+        ctx.fillText('Pulsa Espacio o Enter para volver al menú', w/2, h/2 + 40);
+      }
+
+      _drawMenu(screenState) {
+        const ctx = this.ctx, w = this.canvas.width, h = this.canvas.height;
+        ctx.fillStyle = '#0a0a1a'; ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = '#ffd93d'; ctx.font = '36px monospace'; ctx.textAlign = 'center';
+        ctx.fillText('PINBALL PROGRESIVO', w/2, 150);
+        ctx.font = '24px monospace';
+        screenState.menuOptions.forEach((opt, i) => {
+          ctx.fillStyle = i === screenState.selectedOption ? '#00ff88' : '#aaa';
+          ctx.fillText(opt, w/2, 300 + i * 60);
+        });
+        ctx.fillStyle = '#888'; ctx.font = '14px monospace';
+        ctx.fillText('Usa ↑↓ para mover, Espacio/Enter para seleccionar', w/2, 500);
+      }
+
+      _drawScores(screenState) {
+        const ctx = this.ctx, w = this.canvas.width, h = this.canvas.height;
+        ctx.fillStyle = '#0a0a1a'; ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = '#ffd93d'; ctx.font = '32px monospace'; ctx.textAlign = 'center';
+        ctx.fillText('MEJORES PUNTUACIONES', w/2, 100);
+        ctx.font = '20px monospace';
+        const scores = screenState.scores || [];
+        if (scores.length === 0) {
+          ctx.fillStyle = '#888'; ctx.fillText('(sin puntuaciones guardadas)', w/2, 250);
+        } else {
+          scores.slice(0, 10).forEach((s, i) => {
+            ctx.fillStyle = '#fff';
+            ctx.fillText(`${i+1}. ${s.score} pts (Nivel ${s.level})`, w/2, 200 + i * 40);
+          });
+        }
+        ctx.fillStyle = '#888'; ctx.font = '14px monospace';
+        ctx.fillText('Pulsa Espacio o Enter para volver', w/2, 650);
+      }
+
+      _drawCredits() {
+        const ctx = this.ctx, w = this.canvas.width, h = this.canvas.height;
+        ctx.fillStyle = '#0a0a1a'; ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = '#ffd93d'; ctx.font = '32px monospace'; ctx.textAlign = 'center';
+        ctx.fillText('CRÉDITOS', w/2, 150);
+        ctx.fillStyle = '#fff'; ctx.font = '18px monospace';
+        ctx.fillText('Pinball Progresivo', w/2, 250);
+        ctx.fillText('Arquitectura Hexagonal con Matter.js', w/2, 300);
+        ctx.fillText('Hecho para experimentar con patrones de diseño', w/2, 350);
+        ctx.fillStyle = '#888'; ctx.font = '14px monospace';
+        ctx.fillText('Pulsa Espacio o Enter para volver', w/2, 500);
       }
     }
 
-    // --- 3.3 ADAPTADOR DE ENTRADA (Teclado) ---
+    /** Entrada por teclado, adaptada a diferentes pantallas */
     class KeyboardInputAdapter extends IInput {
-      constructor() {
-        super();
-        this.eventBus = null;
-        this._handler = this._handleKey.bind(this);
-        this._keys = {};
-      }
-
-      start(eventBus) {
-        this.eventBus = eventBus;
-        window.addEventListener('keydown', this._handler);
-        window.addEventListener('keyup', this._handler);
-      }
-
-      stop() {
-        window.removeEventListener('keydown', this._handler);
-        window.removeEventListener('keyup', this._handler);
-      }
+      constructor() { super(); this.eventBus = null; this._handler = this._handleKey.bind(this); }
+      start(eventBus) { this.eventBus = eventBus; window.addEventListener('keydown', this._handler); window.addEventListener('keyup', this._handler); }
+      stop() { window.removeEventListener('keydown', this._handler); window.removeEventListener('keyup', this._handler); }
 
       _handleKey(e) {
-        const key = e.key;
-        const isDown = e.type === 'keydown';
-        // Prevenir scroll con espacio
-        if (key === ' ' || key === 'Space') e.preventDefault();
-
-        // Mapeo de teclas a eventos de dominio
+        const key = e.key, isDown = e.type === 'keydown';
+        if ([' ', 'Space', 'ArrowUp', 'ArrowDown', 'Enter'].includes(key)) e.preventDefault();
+        // Para menús, emitimos eventos de navegación
+        if (key === 'ArrowUp' && isDown) this.eventBus.emit('menu_up');
+        if (key === 'ArrowDown' && isDown) this.eventBus.emit('menu_down');
+        if ((key === ' ' || key === 'Space' || key === 'Enter') && isDown) this.eventBus.emit('menu_select');
+        if (key === 'Escape' && isDown) this.eventBus.emit('menu_back');
+        // Durante juego, eventos de flippers y lanzamiento
         if (key === 'ArrowLeft' || key === 'a' || key === 'A') {
           this.eventBus.emit(isDown ? 'flipper_left_down' : 'flipper_left_up');
         }
         if (key === 'ArrowRight' || key === 'd' || key === 'D') {
           this.eventBus.emit(isDown ? 'flipper_right_down' : 'flipper_right_up');
         }
-        if ((key === ' ' || key === 'Space') && isDown) {
-          this.eventBus.emit('launch');
-        }
+        if ((key === ' ' || key === 'Space') && isDown) this.eventBus.emit('launch');
+        // Teclas para cambiar de nivel (solo durante juego)
+        if (key === '1' && isDown) this.eventBus.emit('select_level', { level: 1 });
+        if (key === '2' && isDown) this.eventBus.emit('select_level', { level: 2 });
+        if (key === '3' && isDown) this.eventBus.emit('select_level', { level: 3 });
+        if (key === 'm' && isDown) this.eventBus.emit('go_to_menu');
       }
     }
 
-    // --- 3.4 ADAPTADOR DE CONFIGURACIÓN (JSON estático) ---
-    class JsonConfigAdapter extends IConfig {
-      async loadTable(source = 'default') {
-        // Configuración de la mesa de prueba
-        return {
-          lives: 3,
-          bumpers: [
-            { id: 'b1', x: 400, y: 300, radius: 25, points: 100 },
-            { id: 'b2', x: 330, y: 240, radius: 25, points: 150 },
-            { id: 'b3', x: 470, y: 240, radius: 25, points: 150 }
-          ],
-          drains: [
-            { id: 'drain_left', x: 200, y: 830, radius: 22 },
-            { id: 'drain_right', x: 600, y: 830, radius: 22 }
-          ]
-        };
-      }
-    }
-
-    // =============================================================================
-    // 4. APLICACIÓN (Orquestador)
-    // =============================================================================
+    // ===========================================================================
+    // 5. ORQUESTADOR PRINCIPAL
+    // ===========================================================================
     class PinballGame {
       constructor(canvasId, logId) {
         this.canvas = document.getElementById(canvasId);
         this.logElement = document.getElementById(logId);
-        this.domain = null;
-        this.physics = null;
-        this.renderer = null;
-        this.input = null;
-        this.configAdapter = null;
         this.eventBus = new EventBus();
-        this.rafId = null;
-        this.lastTime = 0;
-        this.gameOver = false;
-      }
-
-      async init() {
-        // Cargar configuración
+        this.screenManager = new ScreenManager();
+        this.levelManager = new LevelManager();
+        this.persistence = new PersistenceManager();
         this.configAdapter = new JsonConfigAdapter();
-        const config = await this.configAdapter.loadTable();
-        // Instanciar dominio
-        this.domain = new GameDomain(config);
-        // Adaptadores
         this.physics = new MatterPhysicsAdapter(this.canvas.width, this.canvas.height);
         this.renderer = new CanvasRendererAdapter(this.canvas);
         this.input = new KeyboardInputAdapter();
+        this.domain = null;      // se crea al iniciar nivel
+        this.currentLevel = 1;
+        this.gameOver = false;
+        this.rafId = null;
+        this.lastTime = 0;
+        this._log('Pinball Progresivo iniciado. ¡Elige una opción del menú!');
+      }
 
-        // Inicializar física con el estado del dominio y el bus de eventos
-        this.physics.init(this.domain, this.eventBus);
-        // Comenzar escucha de entrada
+      async init() {
+        // Cargar persistencia
+        const unlockedIds = this.persistence.loadUnlockedLevels();
+        this.levelManager.levels.forEach(l => l.unlocked = unlockedIds.includes(l.id));
+        this.screenManager.scores = this.persistence.loadHighScores();
+        this.screenManager.levelUnlocked = this.levelManager.levels.map(l => l.unlocked);
+
+        // Iniciar entrada
         this.input.start(this.eventBus);
-
-        // Suscribirnos a eventos del bus para modificar dominio y física
+        // Suscribir eventos globales
         this._subscribeEvents();
-
-        // Activar la bola inicial
-        this.domain.ballActive = true;
-        this.physics.resetBall(); // Asegura que la bola esté lista
-
-        // Iniciar bucle de juego
+        // Bucle de renderizado
         this.lastTime = performance.now();
-        this.rafId = requestAnimationFrame((t) => this._loop(t));
-
-        this._log('Pinball iniciado. ¡Buena suerte!');
+        this.rafId = requestAnimationFrame(t => this._loop(t));
       }
 
       _subscribeEvents() {
-        // Eventos de colisión (desde el motor)
-        this.eventBus.on('bumper_hit', (data) => {
-          this.domain.handleEvent('bumper_hit', data);
+        // Navegación de menú (eventos genéricos)
+        this.eventBus.on('menu_up', () => {
+          const result = this.screenManager.handleMenuInput('up');
+          if (result === 'start_game') this._startGame();
+        });
+        this.eventBus.on('menu_down', () => {
+          const result = this.screenManager.handleMenuInput('down');
+          if (result === 'start_game') this._startGame();
+        });
+        this.eventBus.on('menu_select', () => {
+          if (this.screenManager.current === 'menu') {
+            const result = this.screenManager.handleMenuInput('select');
+            if (result === 'start_game') this._startGame();
+          } else if (this.screenManager.current === 'scores') {
+            this.screenManager.handleScoresInput('select');
+          } else if (this.screenManager.current === 'gameover') {
+            this.screenManager.handleGameOverInput('select');
+          }
+        });
+        this.eventBus.on('menu_back', () => {
+          if (this.screenManager.current !== 'menu') this.screenManager.goTo('menu');
+        });
+        this.eventBus.on('go_to_menu', () => {
+          this.screenManager.goTo('menu');
+          this.gameOver = false; // resetear estado
+        });
+
+        // Eventos de juego (solo si estamos en pantalla 'game')
+        this.eventBus.on('flipper_left_down', () => { if (this.screenManager.current === 'game') this.physics.activateFlipper('left'); });
+        this.eventBus.on('flipper_left_up', () => { if (this.screenManager.current === 'game') this.physics.deactivateFlipper('left'); });
+        this.eventBus.on('flipper_right_down', () => { if (this.screenManager.current === 'game') this.physics.activateFlipper('right'); });
+        this.eventBus.on('flipper_right_up', () => { if (this.screenManager.current === 'game') this.physics.deactivateFlipper('right'); });
+        this.eventBus.on('launch', () => {
+          if (this.screenManager.current === 'game' && this.domain && this.domain.ballActive) {
+            this.physics.launchBall(0.9);
+          }
+        });
+
+        // Eventos de colisión (durante juego)
+        this.eventBus.on('bumper_hit', data => {
+          if (this.screenManager.current === 'game' && this.domain) this.domain.handleEvent('bumper_hit', data);
         });
         this.eventBus.on('drain', () => {
-          if (!this.domain.ballActive) return; // Evitar múltiples drenajes
+          if (this.screenManager.current !== 'game' || !this.domain || !this.domain.ballActive) return;
           this.domain.handleEvent('drain');
           this._log('¡Bola perdida!');
           if (this.domain.lives <= 0) {
-            this._gameOver();
+            this._onGameOver();
           } else {
-            // Reiniciar bola tras un breve retardo
             setTimeout(() => {
-              if (!this.gameOver) {
+              if (this.screenManager.current === 'game') {
                 this.physics.resetBall();
                 this.domain.resetForNewBall();
-                this._log('Nueva bola lista.');
               }
             }, 800);
           }
         });
 
-        // Eventos de entrada
-        this.eventBus.on('flipper_left_down', () => {
-          this.physics.activateFlipper('left');
-        });
-        this.eventBus.on('flipper_left_up', () => {
-          this.physics.deactivateFlipper('left');
-        });
-        this.eventBus.on('flipper_right_down', () => {
-          this.physics.activateFlipper('right');
-        });
-        this.eventBus.on('flipper_right_up', () => {
-          this.physics.deactivateFlipper('right');
-        });
-        this.eventBus.on('launch', () => {
-          if (!this.domain.ballActive && this.domain.lives > 0) {
-            // Si la bola no está activa (por ejemplo, recién perdida), no lanzar
-            return;
-          }
-          if (this.domain.ballActive) {
-            // Solo lanzar si la bola está en la zona de lanzamiento (opcional)
-            // Por simplicidad, lanzamos siempre que esté activa
-            this.physics.launchBall(0.9);
-            this._log('¡Lanzamiento!');
+        // Selección de nivel (durante juego o menú)
+        this.eventBus.on('select_level', data => {
+          if (this.screenManager.current === 'game') {
+            this._startLevel(data.level);
           }
         });
+      }
+
+      async _startGame() {
+        this.screenManager.goTo('game');
+        this._startLevel(1); // por defecto nivel 1
+      }
+
+      async _startLevel(levelId) {
+        if (!this.levelManager.isLevelUnlocked(levelId)) {
+          this._log(`Nivel ${levelId} bloqueado.`);
+          return;
+        }
+        this.currentLevel = levelId;
+        const source = this.levelManager.getLevelConfigSource(levelId);
+        const config = await this.configAdapter.loadTable(source);
+        config.levelName = `Nivel ${levelId}`; // para mostrar
+        this.domain = new GameDomain(config);
+        this.physics.init(this.domain, this.eventBus);
+        this.domain.ballActive = true;
+        this.gameOver = false;
+        this._log(`Nivel ${levelId} iniciado. ¡A jugar!`);
+      }
+
+      _onGameOver() {
+        this.gameOver = true;
+        this.domain.ballActive = false;
+        // Guardar puntuación en highscores
+        const scores = this.persistence.loadHighScores();
+        scores.push({ score: this.domain.score, level: this.currentLevel, date: new Date().toISOString() });
+        scores.sort((a,b) => b.score - a.score);
+        const topScores = scores.slice(0, 10);
+        this.persistence.saveHighScores(topScores);
+        this.screenManager.scores = topScores;
+        // Verificar si desbloqueamos siguiente nivel
+        if (this.domain.objectivesMet && this.currentLevel < 3) {
+          this.levelManager.unlockNext(this.currentLevel);
+          this.persistence.saveUnlockedLevels(this.levelManager.levels);
+          this._log(`¡Nivel ${this.currentLevel + 1} desbloqueado!`);
+        }
+        this.screenManager.goTo('gameover');
+        this._log('💀 GAME OVER');
       }
 
       _loop(timestamp) {
-        if (this.gameOver) {
-          this.renderer.draw(this.domain, this.physics.sync(this.domain));
-          return; // detener bucle
-        }
         const delta = Math.min(100, timestamp - this.lastTime);
         this.lastTime = timestamp;
-
-        // Actualizar física
-        this.physics.update(delta);
-
-        // Sincronizar estado visual (posiciones)
-        const physicsState = this.physics.sync(this.domain);
-
-        // Renderizar
-        this.renderer.draw(this.domain, physicsState);
-
-        // Solicitar siguiente frame
-        this.rafId = requestAnimationFrame((t) => this._loop(t));
-      }
-
-      _gameOver() {
-        this.gameOver = true;
-        this._log('💀 GAME OVER 💀');
-        this.input.stop();
-        // Podríamos mostrar un mensaje en el canvas
+        // Actualizar física solo durante juego
+        if (this.screenManager.current === 'game' && this.domain && !this.gameOver) {
+          this.physics.update(delta);
+        }
+        // Obtener estado de física para render
+        const physicsState = this.physics.sync(this.domain || { ballActive: false });
+        // Renderizar según pantalla
+        this.renderer.draw(this.domain, physicsState, this.screenManager);
+        this.rafId = requestAnimationFrame(t => this._loop(t));
       }
 
       _log(msg) {
@@ -732,20 +763,16 @@
         entry.textContent = msg;
         this.logElement.appendChild(entry);
         this.logElement.scrollTop = this.logElement.scrollHeight;
-        if (this.logElement.children.length > 50) {
-          this.logElement.removeChild(this.logElement.firstChild);
-        }
+        if (this.logElement.children.length > 50) this.logElement.removeChild(this.logElement.firstChild);
       }
     }
 
-    // =============================================================================
-    // 5. PUNTO DE ENTRADA
-    // =============================================================================
+    // ===========================================================================
+    // 6. PUNTO DE ENTRADA
+    // ===========================================================================
     const game = new PinballGame('gameCanvas', 'log');
-    game.init().catch(err => console.error('Error al iniciar el juego:', err));
-
-    // Exponer para depuración (opcional)
-    window.__game = game;
+    game.init().catch(err => console.error('Error al iniciar:', err));
+    window.__game = game; // para depuración
   </script>
 </body>
 </html>
